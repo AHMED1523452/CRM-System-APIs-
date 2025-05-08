@@ -1,0 +1,302 @@
+namespace CRM.Controllers
+{
+    [ApiController]
+    [Route("Authentication")]
+    [Authorize]
+    public class CRMController(IOptions<JwtOptions> options, AppDbContext dbContext, ILogger<CRMController> logger) : ControllerBase
+    {
+        public IOptions<JwtOptions> Options { get; } = options;
+        public AppDbContext DbContext { get; } = dbContext;
+        public ILogger<CRMController> Logger { get; } = logger;
+
+        [HttpPost]
+        [Route("Login")]
+        [AllowAnonymous]
+        public async Task<ActionResult> Login(AuthenticationRequest request)
+        {
+
+            var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserName == request.UserName);//. will check the Hash Password
+            if (ExistingUser is null || !BCrypt.Net.BCrypt.Verify(request.Password, ExistingUser.Password))
+                return BadRequest("this Profile is not Exist");
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var tokenDescriptor = new SecurityTokenDescriptor
+            {
+                Issuer = Options.Value.Issuer,
+                Audience = Options.Value.Audience,
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Options.Value.SigningKey)), SecurityAlgorithms.Sha256),
+                Subject = new System.Security.Claims.ClaimsIdentity(new Claim[]
+                {
+                    new Claim(ClaimTypes.Name, request.UserName),
+                    new Claim(ClaimTypes.NameIdentifier, ExistingUser.UserID.ToString()),
+                    new Claim(ClaimTypes.Role, "AdminManager"),//.will be Exist in the PayLoad of Token
+                    new Claim(ClaimTypes.Role, "Sales Team"),
+                }),
+                Expires = DateTime.UtcNow.AddMinutes(15)
+            };
+
+            try
+            {
+                var SecurityToken = tokenHandler.CreateToken(tokenDescriptor);
+                var AccessToken = tokenHandler.WriteToken(SecurityToken);
+                logger.LogCritical("something is InValid in LogIn API");
+                var expirationDate = DateTime.UtcNow.AddDays(30);
+                var attribute = new AccessTokenTable
+                {
+                    AccessToken = BCrypt.Net.BCrypt.HashString(AccessToken),//. for any hacker can't deal with the database
+                    ExpirationDate = expirationDate
+                };
+                await DbContext.access.AddAsync(attribute);
+                if (expirationDate > DateTime.UtcNow) //. this condition will be continue for Date of Expiration Date (30 days)
+                    return Ok($"AccessToken : `{attribute.AccessToken}`,RefreshToken : `{attribute.RefreshToken}` ");
+                else
+                    return BadRequest("Token Generation failed");
+            }
+            catch
+            {
+                throw new ArgumentException();
+            }
+        }
+        [HttpPost]
+        [Route("Register")]
+        [AllowAnonymous]
+        public async Task<ActionResult> SignUp(Users users)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs Is Invalid");
+
+            var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserName == users.UserName);
+            if (ExistingUser is not null)
+                return BadRequest("Sorry!! This UserName Or Password is Exist, please Enter Another UserName");
+
+            users.Password = BCrypt.Net.BCrypt.HashPassword(users.Password);
+            await DbContext.Users.AddAsync(users);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+
+        [HttpPost("LogOut")]
+        [Authorize(Roles = "AdminManager , Sales Team")]
+        public async Task<IActionResult> LogOut()
+        {
+            var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if(userIdClaim is null || !int.TryParse(userIdClaim, out int userid))
+            {
+                return Unauthorized("Invalid UserID");
+            }
+
+            var ExistingToken = await DbContext.access.FirstOrDefaultAsync(op => op.UserID == userid);
+            if (ExistingToken != null)
+            {
+                DbContext.access.Remove(ExistingToken);
+                await DbContext.SaveChangesAsync();
+            }
+
+            return Ok("Logged Out Successfully");
+        }
+        [HttpGet("Users/{id}")]
+        [Authorize(Roles = "AdminManager , Sales Teams")]
+        public async Task<IActionResult> GetByID(int id)
+        {
+            var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserID == id);
+            if (ExistingUser is null)
+                return NotFound($"User With ID: `{id}` is Not Exist");
+            return Ok(ExistingUser);
+        }
+
+    }
+
+    [ApiController]
+    [Route("Customers")]
+    [Authorize]
+    public class CustomersController(AppDbContext dbContext, ILogger<CustomersController> logger) : ControllerBase
+    {
+        public AppDbContext DbContext { get; } = dbContext;
+        public ILogger<CustomersController> Logger { get; } = logger;
+
+        [HttpGet]
+        [Route("Customers")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult<IEnumerable<Customers>>> GetAllCustomers()
+        {
+            var Customer = await DbContext.customers.ToListAsync();
+            return Ok(Customer);
+        }
+        
+        [HttpGet]
+        [Route("Get/{id}")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult>GetByID(int id)
+        {
+            var ExitingCustomer = await DbContext.customers.FirstOrDefaultAsync(op => op.CustomerID == id);
+            if (ExitingCustomer is null)
+                return NotFound($"Customer With ID : `{id}` is not Exist");
+            return Ok(ExitingCustomer);
+        }
+
+        [HttpPost]
+        [Route("Customers")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult<int>> CreateCustomer(Customers customer)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs is InValid");
+            logger.LogCritical("");
+            var ExistingCustomer = await DbContext.customers.FirstOrDefaultAsync(op => op.Name == customer.Name);
+            if (ExistingCustomer is not null)
+                return BadRequest("this Name is Already Exist");
+            
+            await DbContext.customers.AddAsync(customer);
+            await DbContext.SaveChangesAsync();
+            return Ok(customer.CustomerID);
+        }
+
+        [HttpPut]
+        [Route("Customers/{id}")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult> Update(int id, Customers customer)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs is InValid");
+
+            var ExistingCustomer = await DbContext.customers.FirstOrDefaultAsync(op => op.CustomerID == id);
+            if (ExistingCustomer is null)
+                return NotFound($"Customer With ID : `{id}` is not Exist");
+
+            ExistingCustomer.Email = customer.Email;
+            ExistingCustomer.Name = customer.Name;
+            ExistingCustomer.Company = customer.Company;
+            DbContext.customers.Update(ExistingCustomer);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+
+        [HttpDelete]
+        [Route("Customers/{id}")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult> Delete(int id)
+        {
+            var ExitingCustomer = await DbContext.customers.FirstOrDefaultAsync(op => op.CustomerID == id);
+            if (ExitingCustomer is null)
+                return NotFound($"Customer With ID : `{id}` is not Exist");
+            DbContext.customers.Remove(ExitingCustomer);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+    }
+
+    [ApiController]
+    [Route("Tasks")]
+    [Authorize]
+    public class TasksController (AppDbContext dbContext, ILogger<Tasks> logger) : ControllerBase
+    {
+        public AppDbContext DbContext { get; } = dbContext;
+        public ILogger<Tasks> Logger { get; } = logger;
+
+        [HttpGet]
+        [Route("Tasks")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult<IEnumerable<Tasks>>> GetAllTasks()
+        {
+            var ExistingTask = await DbContext.task.ToListAsync();
+            return Ok(ExistingTask);
+        }
+
+        [HttpGet]
+        [Route("Tasks/{id}")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult> GetByID(int id)
+        {
+            var ExistingTask = await DbContext.task.FirstOrDefaultAsync(op => op.TaskID == id);
+            if (ExistingTask == null)
+                return BadRequest($"Task with ID : `{id}` is not Exist");
+            return Ok(ExistingTask);
+        }
+
+        [HttpPost]
+        [Route("Tasks")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult<int>> CreateTask(Tasks tasks)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs is InValid");
+
+            var ExistingTask = await DbContext.task.FirstOrDefaultAsync(op => op.TaskID == tasks.TaskID);
+            if (ExistingTask is not null)
+                return BadRequest($"Task is already Exist");
+            await DbContext.task.AddAsync(tasks);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+
+        [HttpPut]
+        [Route("Tasks/{id}")]
+        [Authorize(Roles = "AdminManager , Sales Team")]
+        public async Task<ActionResult> UpdateTask(int id, Tasks tasks)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs Is InValid");
+
+            var ExistingTask = await DbContext.task.FirstOrDefaultAsync(op => op.TaskID == id);
+            if (ExistingTask is null)
+                return NotFound("Task is not Exist");
+
+            ExistingTask.Status = tasks.Status;
+            ExistingTask.Description = tasks.Description;
+            ExistingTask.DueTime = tasks.DueTime;
+            ExistingTask.Title = tasks.Title;
+            DbContext.task.Update(ExistingTask);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+
+        [HttpDelete]
+        [Route("Task/{id}")]
+        [Authorize(Roles = "AdminManager, Sales Team")]
+        public async Task<ActionResult> RemoveTask(int id)
+        {
+            var ExistingTask = await DbContext.task.FirstOrDefaultAsync(op => op.TaskID == id);
+            if (ExistingTask is null)
+                return NotFound("Task is not Exist");
+            DbContext.task.Remove(ExistingTask);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }
+    }
+
+    [ApiController]
+    [Route("Sales")]
+    [Authorize]
+    public class SalesController(AppDbContext dbContext, ILogger<SalesController> logger) : ControllerBase
+    {
+        public AppDbContext DbContext { get; } = dbContext;
+        public ILogger<SalesController> Logger { get; } = logger;
+
+        [HttpGet]
+        [Route("Sales")]
+        [Authorize("AdminManager")]
+        public async Task<ActionResult> GetSales()
+        {
+            var ExistingSale = await DbContext.Sale.ToListAsync();
+            if (ExistingSale is null)
+                return NotFound("Empty!!");
+            return Ok(ExistingSale);
+        }
+
+        [HttpPost]
+        [Route("Sales")]
+        [Authorize(Roles = "AdminManager")]
+        public async Task<ActionResult<int>> CreateSale(Sales sales)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Inputs is Invalid");
+
+            var ExistingSale = await DbContext.Sale.FirstOrDefaultAsync(op => op.SaleID == sales.SaleID);
+            if (ExistingSale is not null)
+                return BadRequest("These Inputs is Already Exist");
+
+            await DbContext.Sale.AddAsync(sales);
+            await DbContext.SaveChangesAsync();
+            return Ok("Done!");
+        }   
+    }
+}
