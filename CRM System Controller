@@ -3,11 +3,19 @@ namespace CRM.Controllers
     [ApiController]
     [Route("Authentication")]
     [Authorize]
-    public class CRMController(IOptions<JwtOptions> options, AppDbContext dbContext, ILogger<CRMController> logger) : ControllerBase
+    public class CRMController : ControllerBase
     {
-        public IOptions<JwtOptions> Options { get; } = options;
-        public AppDbContext DbContext { get; } = dbContext;
-        public ILogger<CRMController> Logger { get; } = logger;
+        public CRMController(IOptions<JwtOptions> jwtOptions, ILogger<CRMController> logger, AppDbContext dbContext, TokenService tokenService)
+        {
+            JwtOptions = jwtOptions;
+            Logger = logger;
+            DbContext = dbContext;
+            TokenService = tokenService;
+        }
+        public AppDbContext DbContext { get; }
+        public TokenService TokenService { get; }
+        public ILogger<CRMController> Logger { get; }
+        public IOptions<JwtOptions> JwtOptions { get; }
 
         [HttpPost]
         [Route("Login")]
@@ -17,65 +25,81 @@ namespace CRM.Controllers
 
             var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserName == request.UserName);//. will check the Hash Password
             if (ExistingUser is null || !BCrypt.Net.BCrypt.Verify(request.Password, ExistingUser.Password))
-                return BadRequest("this Profile is not Exist");
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var tokenDescriptor = new SecurityTokenDescriptor
-            {
-                Issuer = Options.Value.Issuer,
-                Audience = Options.Value.Audience,
-                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Options.Value.SigningKey)), SecurityAlgorithms.Sha256),
-                Subject = new System.Security.Claims.ClaimsIdentity(new Claim[]
-                {
-                    new Claim(ClaimTypes.Name, request.UserName),
-                    new Claim(ClaimTypes.NameIdentifier, ExistingUser.UserID.ToString()),
-                    new Claim(ClaimTypes.Role, "AdminManager"),//.will be Exist in the PayLoad of Token
-                    new Claim(ClaimTypes.Role, "Sales Team"),
-                }),
-                Expires = DateTime.UtcNow.AddMinutes(15)
-            };
+                return BadRequest("This Profile is not Exist");
 
-            try
+            if (string.IsNullOrEmpty(JwtOptions.Value.SigningKey))
+                return BadRequest("Key is Empty");
+
+            var accessToken = TokenService.CreateAccessToken(ExistingUser);
+            var refreshToken = TokenService.CreateRefreshToken();
+
+            Logger.LogCritical("something is InValid in LogIn API");
+
+            var expirationDate = DateTime.UtcNow.AddDays(15);
+            var attribute = new AccessTokenAttributes
             {
-                var SecurityToken = tokenHandler.CreateToken(tokenDescriptor);
-                var AccessToken = tokenHandler.WriteToken(SecurityToken);
-                logger.LogCritical("something is InValid in LogIn API");
-                var expirationDate = DateTime.UtcNow.AddDays(30);
-                var attribute = new AccessTokenTable
-                {
-                    AccessToken = BCrypt.Net.BCrypt.HashString(AccessToken),//. for any hacker can't deal with the database
-                    ExpirationDate = expirationDate
-                };
-                await DbContext.access.AddAsync(attribute);
-                if (expirationDate > DateTime.UtcNow) //. this condition will be continue for Date of Expiration Date (30 days)
-                    return Ok($"AccessToken : `{attribute.AccessToken}`,RefreshToken : `{attribute.RefreshToken}` ");
-                else
-                    return BadRequest("Token Generation failed");
-            }
-            catch
+                UserID = ExistingUser.UserID,
+                AccessToken = BCrypt.Net.BCrypt.HashString(accessToken),//. for any hacker can't deal with the database
+                ExpirationDate = expirationDate,
+                IssuedAt = DateTime.UtcNow
+            };
+            attribute.RefreshToken = refreshToken;
+
+            await DbContext.access.AddAsync(attribute);
+            await DbContext.SaveChangesAsync();
+
+            return Ok(new
             {
-                throw new ArgumentException();
-            }
+                accessToken,
+                refreshToken
+            });
         }
-        [HttpPost]
-        [Route("Register")]
+        [HttpPost("RefreshToken")]
         [AllowAnonymous]
-        public async Task<ActionResult> SignUp(Users users)
+        public async Task<ActionResult<TokenService>> RefreshToken(AccessTokenAttributes accessToken)
+        {
+            var existingToken = await DbContext.access.Include(op => op.users)
+                .FirstOrDefaultAsync(op => op.AccessToken == accessToken.AccessToken);
+            if (existingToken == null || DateTime.UtcNow < existingToken.ExpirationDate)
+                return Unauthorized("Not expired until now");
+
+            var NewAccessToken = TokenService.CreateAccessToken(existingToken.users);
+            var NewRefreshToken = TokenService.CreateRefreshToken();
+
+            existingToken.AccessToken = NewAccessToken;
+            existingToken.RefreshToken = NewRefreshToken;
+            existingToken.ExpirationDate = DateTime.UtcNow.AddDays(15);
+            existingToken.IssuedAt = DateTime.UtcNow;
+
+            return Ok(NewRefreshToken);
+        }
+
+        [HttpPost]
+        [Route("SignUp")]
+        [AllowAnonymous]
+        public async Task<ActionResult<Users>> SignUp(UserDTO userDTO)
         {
             if (!ModelState.IsValid)
                 return BadRequest("Inputs Is Invalid");
 
-            var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserName == users.UserName);
+            var ExistingUser = await DbContext.Users.FirstOrDefaultAsync(op => op.UserName == userDTO.UserName);
             if (ExistingUser is not null)
-                return BadRequest("Sorry!! This UserName Or Password is Exist, please Enter Another UserName");
+                return BadRequest("Sorry!! This UserName Or Password is already Exist");
 
-            users.Password = BCrypt.Net.BCrypt.HashPassword(users.Password);
-            await DbContext.Users.AddAsync(users);
+            var user = new Users
+            {
+                Email = userDTO.Email,
+                Password = BCrypt.Net.BCrypt.HashPassword(userDTO.Password),
+                Role = userDTO.Role,
+                UserName = userDTO.UserName
+            };
+            await DbContext.Users.AddAsync(user);
             await DbContext.SaveChangesAsync();
-            return Ok("Done!");
+            return Ok(user.UserID);
         }
 
         [HttpPost("LogOut")]
-        [Authorize(Roles = "AdminManager , Sales Team")]
+        [Authorize(Roles = "Admin, Sales team")]
         public async Task<IActionResult> LogOut()
         {
             var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
